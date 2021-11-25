@@ -1,14 +1,23 @@
 package test
 
 import (
-	sql "github.com/Shopify/ghostferry/sqlwrapper"
+	"errors"
 	"math/rand"
 	"testing"
 
+	sql "github.com/Shopify/ghostferry/sqlwrapper"
+	"github.com/go-mysql-org/go-mysql/replication"
+
+	"github.com/Shopify/ghostferry"
 	"github.com/Shopify/ghostferry/sharding"
 	"github.com/Shopify/ghostferry/testhelpers"
 	"github.com/stretchr/testify/assert"
 )
+
+func queryEventHandler(ev *replication.BinlogEvent, query []byte, es *ghostferry.BinlogEventState) ([]byte, error) {
+	query = ev.Event.(*replication.QueryEvent).Query
+	return query, errors.New("Query event")
+}
 
 func setupSingleTableDatabase(f *testhelpers.TestFerry, sourceDB, targetDB *sql.DB) {
 	testhelpers.SeedInitialData(sourceDB, "gftest", "table1", 100)
@@ -16,6 +25,10 @@ func setupSingleTableDatabase(f *testhelpers.TestFerry, sourceDB, targetDB *sql.
 
 	testhelpers.AddTenantID(sourceDB, "gftest", "table1", 3)
 	testhelpers.AddTenantID(targetDB, "gftest", "table1", 3)
+}
+
+func addBinLogEventHandler(f *testhelpers.TestFerry, sourceDB, targetDB *sql.DB) {
+	f.Ferry.BinlogStreamer.AddBinlogEventHandler("QueryEvent", queryEventHandler)
 }
 
 func selectiveFerry(tenantId interface{}) *testhelpers.TestFerry {
@@ -141,4 +154,40 @@ func TestErrorsIfShardingKeyChanged(t *testing.T) {
 
 	assert.NotNil(t, errorHandler.LastError)
 	assert.Equal(t, "sharding key changed from 2 to 1", errorHandler.LastError.Error())
+}
+
+type InsertDDLWriter struct {
+	db *sql.DB
+}
+
+func (this *InsertDDLWriter) Run() {
+	this.db.Exec("ALTER TABLE gftest.table1 MODIFY COLUMN data varchar(255)")
+}
+
+func (this *InsertDDLWriter) Stop() {}
+
+func (this *InsertDDLWriter) Wait() {}
+
+func (this *InsertDDLWriter) SetDB(db *sql.DB) {
+	this.db = db
+}
+
+func TestErrorsIfDDLDetected(t *testing.T) {
+	errorHandler := &testhelpers.ErrorHandler{}
+	ferry := selectiveFerry(int64(2))
+	ferry.ErrorHandler = errorHandler
+
+	testcase := &testhelpers.IntegrationTestCase{
+		T:                     t,
+		Ferry:                 ferry,
+		SetupAction:           setupSingleTableDatabase,
+		AfterInitializeAction: addBinLogEventHandler,
+		DataWriter:            &InsertDDLWriter{},
+	}
+
+	defer testcase.Teardown()
+	testcase.CopyData()
+
+	assert.NotNil(t, errorHandler.LastError)
+	assert.Equal(t, "Query event", errorHandler.LastError.Error())
 }
